@@ -1,0 +1,3 @@
+/* Manifest-only resource script for the MinGW/windres path.
+ * The MSVC path injects the same manifest with mt.exe after linking. */
+1 RT_MANIFEST "nvcolor.manifest"

@@ -1,0 +1,19 @@
+# Normalise text in the repository itself rather than leaving it to each
+# machine's core.autocrlf, which is how the shell scripts ended up committed
+# with CRLF in the first place.
+#
+# That mattered silently until now: CI ran `sh tests/run-tests.sh` on
+# ubuntu-latest, and a script whose lines end in CR is not reliably valid to
+# POSIX sh. It was luck rather than design that it had not bitten.
+* text=auto
+
+# Check these out with LF no matter what core.autocrlf says. They are run by
+# `sh` in CI on Linux, where a trailing CR is a syntax error waiting to happen.
+*.sh text eol=lf
+
+# ...and these out with CRLF, because cmd.exe expects them that way.
+*.bat text eol=crlf
+
+# C sources and headers: keep them LF for readable diffs.
+*.c   text eol=lf
+*.h   text eol=lf

@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Pin NVAPI constants (compile-time assertions)
+        run: cl /nologo /W4 /WX /c /Isrc verify_structs.c /Fo:verify_structs.obj
+        shell: cmd
+
+      - name: Build nvcolor.exe (static CRT, /W4 /WX)
+        run: build-msvc.bat
+        shell: cmd
+
+      - name: Fail if version.h disagrees with the tag
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/','' }
+                 else { $env:INPUT_TAG }
+          $want = $tag -replace '^v',''   # strip the prefix, not a char set
+          $have = (Select-String -Path src/version.h -Pattern '#define NVCOLOR_VERSION_STR\s+"([^"]+)"').Matches[0].Groups[1].Value
+          if (-not $have) { Write-Error "could not read NVCOLOR_VERSION_STR from src/version.h"; exit 1 }
+          if ($want -ne $have) {
+            Write-Error "tag $tag expects version $want but src/version.h says $have"
+            exit 1
+          }
+          Write-Host "version.h matches tag: $have"
+
+      - name: Run the host-side unit tests
+        # A tag push triggers only this workflow, not ci.yml, so without this
+        # a release could be published from a commit whose tests had never
+        # run. gcc is present on the windows-latest image.
+        run: sh tests/run-tests.sh
+        shell: pwsh
+
+      - name: Smoke-test
+        run: |
+          build\nvcolor.exe --version || exit /b 1
+          build\nvcolor.exe --selftest || exit /b 1
+        shell: cmd
+
+      - name: Package and checksum
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/','' }
+                 else { "v" + (Select-String -Path src/version.h -Pattern '#define NVCOLOR_VERSION_STR\s+"([^"]+)"').Matches[0].Groups[1].Value }
+          $zip = "nvcolor-$tag-windows-x64.zip"
+          Compress-Archive -Path build\nvcolor.exe -DestinationPath $zip -Force
+          # Conventional sha256sum format so `sha256sum -c` works. Written with
+          # explicit LF and no BOM: Set-Content emits CRLF, which leaves a
+          # trailing carriage return on the filename and makes verification
+          # fail with "No such file or directory".
+          $h = (Get-FileHash build\nvcolor.exe -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText("SHA256SUMS.txt", "$h  nvcolor.exe`n",
+                                          (New-Object System.Text.UTF8Encoding($false)))
+          $bytes = [System.IO.File]::ReadAllBytes("SHA256SUMS.txt")
+          Write-Host "SHA256SUMS.txt = $($bytes.Length) bytes, last byte 0x$('{0:x2}' -f $bytes[-1]) (expect 0x0a)"
+          if ($bytes[-1] -ne 10) { Write-Error "SHA256SUMS.txt has no LF terminator"; exit 1 }
+          "artifact: $zip  ($((Get-Item $zip).Length) bytes)"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Required for workflow_dispatch: without it the action cannot infer
+          # a tag from a branch ref and throws "GitHub Releases requires a tag".
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            nvcolor-*-windows-x64.zip
+            SHA256SUMS.txt
+          generate_release_notes: true
+          body: |
+            ## Download
+
+            **`nvcolor-*-windows-x64.zip`** — contains a single `nvcolor.exe`.
+            Unzip anywhere (no installer, no admin rights needed) and run it.
+
+            ### Windows will warn you the first time
+
+            This build is **not code-signed**, so SmartScreen shows
+            *"Windows protected your PC"*. That is expected for any unsigned
+            binary, including most open-source Windows utilities. Click
+            **More info → Run anyway**.
+
+            If the file is quarantined instead, open PowerShell and run:
+
+            ```powershell
+            Unblock-File .\nvcolor.exe
+            ```
+
+            ### Verify the download
+
+            ```
+            certutil -hashfile nvcolor.exe SHA256
+            ```
+
+            and compare against `SHA256SUMS.txt` in this release.
+
+            ### Check it runs
+
+            ```
+            nvcolor.exe --selftest
+            ```
+
+            Needs no GPU and no admin rights. It reports whether the driver
+            and the private NVAPI entries were found, and verifies the gamma
+            ramp maths.
+
+            ---
+
+            Built from the tagged source with MSVC `/MT` (static CRT) at `/W4 /WX`.
+            CI runs on every push: <https://github.com/${{ github.repository }}/actions>

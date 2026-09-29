@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and smoke-test (MSVC, Windows)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Pin NVAPI constants (compile-time assertions)
+        run: |
+          if not exist build mkdir build
+          cl /nologo /W4 /WX /c /Isrc verify_structs.c /Fo:build\verify_structs.obj
+        shell: cmd
+
+      - name: Build nvcolor.exe
+        run: build-msvc.bat
+        shell: cmd
+
+      - name: Show what we produced
+        shell: pwsh
+        run: |
+          Get-ChildItem build | Format-Table Name, Length
+          $f = Get-Item build\nvcolor.exe
+          "nvcolor.exe = $($f.Length) bytes"
+          # Only catch a stub/truncated link. The real /MT build is ~229 KB,
+          # so keep the floor far below it - a threshold inside the documented
+          # range would reject a legitimately smaller build.
+          if ($f.Length -lt 20000) { Write-Error "suspiciously small binary"; exit 1 }
+
+      - name: Smoke-test the shipped binary
+        # The real test of a downloadable artifact: run the exact EXE a user
+        # will download, not a rebuilt variant. The runner has no NVIDIA GPU,
+        # which is the point - --selftest must degrade gracefully and still
+        # verify the gamma ramp maths.
+        # Each invocation is guarded with "|| exit /b 1". A cmd script's exit
+        # code is that of its LAST command, and "echo ::endgroup::" always
+        # returns 0 - so an unguarded --selftest failure was silently discarded
+        # and the step reported success.
+        # Markers around every invocation: if one hangs, the last marker
+        # printed in the log says exactly which. Output is redirected to a
+        # file because a GUI subsystem binary's stdout is not the step's
+        # console by default.
+        run: |
+          echo ===MARK-A===
+          build\nvcolor.exe --version > out_v.txt 2>&1
+          echo ===MARK-B-rc=%ERRORLEVEL%===
+          type out_v.txt
+          echo ===MARK-C===
+          build\nvcolor.exe --help > out_h.txt 2>&1
+          echo ===MARK-D-rc=%ERRORLEVEL%===
+          type out_h.txt
+          echo ===MARK-E===
+          build\nvcolor.exe --selftest > out_s.txt 2>&1
+          echo ===MARK-F-rc=%ERRORLEVEL%===
+          type out_s.txt
+          echo ===MARK-G===
+          build\nvcolor.exe "--version " > out_t.txt 2>&1
+          echo ===MARK-H-rc=%ERRORLEVEL%===
+          type out_t.txt
+          echo ===MARK-I===
+          build\nvcolor.exe --bogus-option > out_b.txt 2>&1
+          echo ===MARK-J-rc=%ERRORLEVEL%===
+          type out_b.txt
+          echo ===MARK-DONE===
+
+          REM Assertions. Correct expected strings matter: --selftest prints
+          REM "RESULT: OK", not the test suite's "ALL GAMMA CHECKS PASSED".
+          findstr /C:"nvcolor 1." out_v.txt >nul || exit /b 1
+          findstr /C:"--selftest" out_h.txt >nul || exit /b 1
+          findstr /C:"RESULT: OK" out_s.txt >nul || exit /b 1
+          findstr /C:"[ok]" out_s.txt >nul || exit /b 1
+          findstr /C:"nvcolor 1." out_t.txt >nul || exit /b 1
+          findstr /C:"unrecognised argument" out_b.txt >nul || exit /b 1
+          echo All expected outputs present.
+        shell: cmd
+
+      - name: Confirm the manifest really landed in the binary
+        run: |
+          $mt = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Select-Object -Last 1
+          & $mt -inputresource:build\nvcolor.exe -out:extracted.manifest
+          Get-Content extracted.manifest
+          if (-not (Select-String -Path extracted.manifest -Pattern 'PerMonitorV2' -Quiet)) {
+            Write-Error "PerMonitorV2 missing from the embedded manifest"
+            exit 1
+          }
+          if (-not (Select-String -Path extracted.manifest -Pattern 'asInvoker' -Quiet)) {
+            Write-Error "requestedExecutionLevel missing from the embedded manifest"
+            exit 1
+          }
+          Write-Host "manifest OK: DPI awareness and asInvoker present"
+        shell: pwsh
+
+      - name: Version numbers must agree everywhere
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path src/version.h -Pattern '#define NVCOLOR_VERSION_STR\s+"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "src/version.h says $v"
+
+          # nvcolor.rc must derive from version.h, not hardcode a literal.
+          $rc = Get-Content src/nvcolor.rc -Raw
+          if ($rc -notmatch 'NVCOLOR_VERSION_MAJOR,NVCOLOR_VERSION_MINOR') {
+            Write-Error "nvcolor.rc does not use the version.h macros for FILEVERSION"
+            exit 1
+          }
+          if ($rc -match '"\d+\.\d+\.\d+\.\d+"') {
+            Write-Error "nvcolor.rc still contains a hardcoded version string"
+            exit 1
+          }
+
+          # assemblyIdentity needs a 4-part literal, so check it explicitly.
+          $mf = Get-Content src/nvcolor.manifest -Raw
+          if ($mf -notmatch [regex]::Escape("version=`"$v.0`"")) {
+            Write-Error "nvcolor.manifest assemblyIdentity should be version=`"$v.0`""
+            exit 1
+          }
+
+          # The real assertion: what Explorer will actually show.
+          $vi = (Get-Item build\nvcolor.exe).VersionInfo
+          Write-Host "EXE FileVersion    = $($vi.FileVersion)"
+          Write-Host "EXE ProductVersion = $($vi.ProductVersion)"
+          if ($vi.FileVersion    -notlike "$v*") { Write-Error "EXE FileVersion does not start with $v"; exit 1 }
+          if ($vi.ProductVersion -notlike "$v*") { Write-Error "EXE ProductVersion does not start with $v"; exit 1 }
+          if ($vi.ProductName -ne 'nvcolor') { Write-Error "EXE ProductName is '$($vi.ProductName)'"; exit 1 }
+          Write-Host "version $v consistent across version.h, nvcolor.rc, nvcolor.manifest and the built EXE"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvcolor-windows-x64
+          path: build/nvcolor.exe
+          if-no-files-found: error
+
+  tests:
+    name: Unit tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gamma ramp unit tests
+        run: sh tests/run-tests.sh
